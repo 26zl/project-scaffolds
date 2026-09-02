@@ -1,0 +1,3 @@
+# Keep LF in the working tree on every platform: a Windows clone would otherwise
+# hand these scripts to bash with CR line endings.
+* text=auto eol=lf
