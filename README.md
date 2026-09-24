@@ -76,9 +76,10 @@ reads collections from `~/.ansible/collections` and
 `/usr/share/ansible/collections`. The Terraform project pins only the core
 version and uses the built-in `terraform_data` as its placeholder, so `init`,
 `validate` and `plan` need no provider. Nothing is downloaded, so nothing is
-locked either: the tools are whatever the machine has. A project scaffolded
-online runs offline with `-o -f` too; its `profile_tasks` callback is skipped
-with a warning until `ansible.posix` is installed.
+locked either: the tools are whatever the machine has. An Ansible project
+scaffolded online runs offline with `-o -f` too; its `profile_tasks` callback
+is skipped with a warning until `ansible.posix` is installed. A Terraform one
+needs its providers from a mirror first.
 
 ## Supply chain
 

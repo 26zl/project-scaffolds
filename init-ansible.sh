@@ -24,6 +24,12 @@ put() {
 	fi
 }
 
+# Galaxy counts a collection on any configured path as installed, so the locked collections are handled with only the project's own path.
+# It is not exported: ansible-lint leaves its per-project cache for ~/.ansible whenever that variable is set.
+galaxy() {
+	ANSIBLE_COLLECTIONS_PATH="$root/collections" ansible-galaxy "$@"
+}
+
 # Print pip option $1 as pip install resolves it: the install section wins over global.
 # pip prints values with %r, so they are single-quoted unless they hold a single quote.
 pip_option() {
@@ -98,7 +104,7 @@ index = urllib.parse.urlsplit(os.environ["LOCK_INDEX"])
 auth = None
 if index.username is not None:
     login = "%s:%s" % (urllib.parse.unquote(index.username), urllib.parse.unquote(index.password or ""))
-    auth = "Basic " + base64.b64encode(login.encode()).decode()
+    auth = "Basic " + base64.b64encode(login.encode("latin-1")).decode()
     index = index._replace(netloc=index.netloc.rpartition("@")[2])
 index = urllib.parse.urlunsplit(index)
 rows = []
@@ -166,7 +172,7 @@ project is not empty, so that needs -f.
                      run with the ansible-core and python3 installed there -
                      no venv, lock, collections, audit or lint, and nothing
                      is downloaded
-  PYTHON_VERSION=X  pin the interpreter a new venv is built with (default:
+  PYTHON_VERSION=X   pin the interpreter a new venv is built with (default:
                      python3). An interpreter older than ansible-core
                      supports is refused rather than locked to an old core. An
                      existing .venv keeps the Python it was created with;
@@ -538,10 +544,18 @@ while IFS= read -r -d '' f; do
 		status=1
 	fi
 	# A commit takes the staged copy, which stays plaintext when a file was added before it was encrypted.
-	if git cat-file -e ":$f" 2>/dev/null && [ "$(git cat-file blob ":$f" | head -c 14)" != '$ANSIBLE_VAULT' ]; then
-		printf 'unencrypted vault file staged: %s\n' "$f" >&2
-		status=1
-	fi
+	# The entry is looked up relative to this directory, which need not be the repository root; a staged symlink holds only a path.
+	staged=$(git ls-files -s -- ":(literal)$f")
+	case $staged in
+	'' | 120000\ *) ;;
+	*)
+		blob=${staged#* }
+		if [ "$(git cat-file blob "${blob%% *}" | head -c 14)" != '$ANSIBLE_VAULT' ]; then
+			printf 'unencrypted vault file staged: %s\n' "$f" >&2
+			status=1
+		fi
+		;;
+	esac
 done < <({ git ls-files -co --exclude-standard -z -- '*vault*.yml' '*vault*.yaml' '*vault*.json' && printf '\0'; })
 [ "$scan_complete" -eq 1 ] || {
 	printf 'vault-check: could not enumerate files\n' >&2
@@ -683,7 +697,7 @@ if [ "$offline" -eq 0 ]; then
 	if [ -e collections/requirements.yml ] || [ -L collections/requirements.yml ]; then
 		[ -f collections/requirements.yml ] || die "collections/requirements.yml exists but is not a regular file"
 		printf 'keep collections/requirements.yml\n'
-		ansible-galaxy collection install -r collections/requirements.yml -p collections
+		galaxy collection install -r collections/requirements.yml -p collections
 	else
 		# Galaxy has no cooldown of its own, so each requested collection is pinned to its newest release from before the cutoff; dependencies are locked as installed.
 		# A kept requirements.yml is installed unchecked, so the pins wait in .venv until the whole installed set has passed the cooldown.
@@ -698,7 +712,7 @@ if [ "$offline" -eq 0 ]; then
 			echo "collections:"
 			printf '%s\n' "${pins[@]}"
 		} >.venv/collection-pins.yml
-		ansible-galaxy collection install -r .venv/collection-pins.yml -p collections
+		galaxy collection install -r .venv/collection-pins.yml -p collections
 		# Galaxy picks the dependencies itself, so every installed version is held to the same cutoff before it is locked.
 		cooldown_rc=0
 		check_collection_cooldown collections/ansible_collections/*/*/MANIFEST.json || cooldown_rc=$?
@@ -736,10 +750,10 @@ ansible --version | sed -n 1p
 if [ "$offline" -eq 0 ]; then
 	ansible-lint --version | sed -n 1p
 	ansible-navigator --version | sed -n 1p
-	ansible-galaxy collection list -p collections 2>/dev/null | sed -n '/^ansible\./p;/^community\./p'
+	galaxy collection list -p collections 2>/dev/null | sed -n '/^ansible\./p;/^community\./p'
 	# Imported plugins leave __pycache__ in the collection tree, which verify reports as modified content.
 	find collections -name __pycache__ -type d -prune -exec rm -rf {} +
-	ansible-galaxy collection verify --offline -r collections/requirements.yml -p collections
+	galaxy collection verify --offline -r collections/requirements.yml -p collections
 fi
 bin/vault-check.sh
 ansible-inventory -i inventory/dev --graph

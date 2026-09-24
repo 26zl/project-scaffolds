@@ -304,6 +304,18 @@ HOME=$home ANSIBLE_CONFIG="$tmp/ans/ansible.cfg" "$tmp/ans/.venv/bin/ansible-vau
 staged_msg=$("$tmp/ans/bin/vault-check.sh" 2>&1) && fail "ansible: vault-check accepted a vault file that is still staged in plaintext"
 [ "$staged_msg" = "unencrypted vault file staged: $staged" ] || fail "ansible: vault-check did not name just the plaintext left in the index; got: $staged_msg"
 git -C "$tmp/ans" rm -q -f -- "$staged"
+# A project nested below the repository root has its index read all the same, and a staged symlink holds only a path.
+mkdir -p "$tmp/mono/infra/bin" "$tmp/mono/infra/eu"
+git init -q "$tmp/mono"
+cp "$tmp/ans/bin/vault-check.sh" "$tmp/mono/infra/bin/"
+printf 'plain: staged\n' >"$tmp/mono/infra/vault.yml"
+git -C "$tmp/mono" add infra/vault.yml
+printf '%sANSIBLE_VAULT;1.1;AES256\n' '$' >"$tmp/mono/infra/vault.yml"
+! "$tmp/mono/infra/bin/vault-check.sh" 2>/dev/null || fail "ansible: vault-check missed plaintext staged in a project below the repository root"
+git -C "$tmp/mono" add infra/vault.yml
+ln -s ../vault.yml "$tmp/mono/infra/eu/vault.yml"
+git -C "$tmp/mono" add infra/eu/vault.yml
+"$tmp/mono/infra/bin/vault-check.sh" || fail "ansible: vault-check refused a staged symlink to an encrypted vault file"
 echo "ok: vault round-trip and plaintext guard"
 
 # -o runs on an ansible-core that is already installed; the scaffold's venv stands in for one, reached only through PATH.
@@ -322,6 +334,11 @@ mode600 "$home/.ansible/vault/ansoff-dev" || fail "ansible: -o did not make the 
 mkdir -p "$tmp/ansoff/collections/ansible_collections/carried"
 ./clean.sh "$tmp/ansoff" >/dev/null
 [ -d "$tmp/ansoff/collections/ansible_collections/carried" ] || fail "clean: removed collections an offline project cannot reinstall"
+# requirements.in marks a project an online run reinstalls, even one stopped before its requirements.yml was written.
+: >"$tmp/ansoff/requirements.in"
+./clean.sh "$tmp/ansoff" >/dev/null
+[ ! -e "$tmp/ansoff/collections/ansible_collections" ] || fail "clean: kept the collections of a project an online run reinstalls"
+rm "$tmp/ansoff/requirements.in"
 expect "$(./init-ansible.sh -o -d "$tmp/ansoff" 2>&1 || true)" '*use one or the other*' "ansible: -o together with -d was not refused"
 echo "ok: ansible -o scaffolds from the installed ansible-core without network"
 
@@ -450,11 +467,23 @@ echo "ok: ansible -f keeps files and pins"
 
 # A clone under another directory name must keep using the keys its ansible.cfg names, not generate its own.
 mkdir -p "$tmp/renamed"
-cp -R "$tmp/ans"/. "$tmp/renamed"/ && rm -rf "$tmp/renamed/.venv"
-cloned=$(HOME=$home ./init-ansible.sh -f "$tmp/renamed" 2>&1)
+cp -R "$tmp/ans"/. "$tmp/renamed"/ && rm -rf "$tmp/renamed/.venv" "$tmp/renamed/collections/ansible_collections"
+# Galaxy skips a collection that any configured path already holds, so the clone's must be installed while another path has them.
+cloned=$(HOME=$home ANSIBLE_COLLECTIONS_PATH="$tmp/ans/collections" ./init-ansible.sh -f "$tmp/renamed" 2>&1) || fail "ansible: the renamed clone failed: $cloned"
 expect "$cloned" "*keep $home/.ansible/vault/ans-dev*" "ansible: a renamed clone did not keep the keys ansible.cfg names"
 [ ! -e "$home/.ansible/vault/renamed-dev" ] || fail "ansible: a renamed clone generated keys of its own"
+[ -d "$tmp/renamed/collections/ansible_collections/ansible/posix" ] || fail "ansible: a collection found on another path was not installed into the project"
 echo "ok: renamed clone keeps the keys ansible.cfg names"
+
+# A first run cut short before the cooldown check must leave no requirements.yml, which the next run would trust unchecked.
+mv "$tmp/ans/collections/ansible_collections" "$tmp/installed"
+mv "$tmp/ans/collections/requirements.yml" "$tmp/ans/collections/lock.sha256" "$tmp/"
+! HOME=$home ANSIBLE_GALAXY_SERVER=http://127.0.0.1:1 ./init-ansible.sh -f "$tmp/ans" >/dev/null 2>&1 || fail "ansible: a collection install from an unreachable Galaxy succeeded"
+[ ! -e "$tmp/ans/collections/requirements.yml" ] || fail "ansible: an interrupted first run left pins the next run would trust"
+rm -rf "$tmp/ans/collections/ansible_collections"
+mv "$tmp/installed" "$tmp/ans/collections/ansible_collections"
+mv "$tmp/requirements.yml" "$tmp/lock.sha256" "$tmp/ans/collections/"
+echo "ok: an interrupted collection install leaves no pins behind"
 
 # Vault keys are never clean.sh's to remove, and -c reaches only directories below the user's cache roots.
 ! ./clean.sh -k "$tmp/ans" >/dev/null 2>&1 || fail "clean: -k was accepted, but keys are not clean's to remove"

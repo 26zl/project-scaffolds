@@ -97,8 +97,10 @@ add_cache() {
 # What a scaffold run or the tools it installs write next to the project files; each is rebuilt or regenerated.
 # Logs are named one by one: a *.log glob would also take a log the project keeps by hand, which nothing rebuilds.
 add .venv
-# Installed collections are rebuilt from requirements.yml; an offline project has none, so its collections were carried in by hand.
-[ ! -f collections/requirements.yml ] || add collections/ansible_collections
+# An online run reinstalls collections; a project with neither of its files was built offline, so its collections were carried in by hand.
+if [ -f collections/requirements.yml ] || [ -f requirements.in ]; then
+	add collections/ansible_collections
+fi
 add .ansible
 add .ansible_cache
 add .terraform
