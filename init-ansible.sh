@@ -62,8 +62,7 @@ PY
 }
 
 # Refuse any resolved collection uploaded inside the cooldown, including dependencies chosen by Galaxy.
-# Exit 2 means a release really is too new. Any other failure means Galaxy did not answer, which is not the
-# same thing and must not be reported as one: the pins are still good, they just could not be checked.
+# Exit 2 means a release is too new; any other failure means Galaxy did not answer, which must not read as one.
 check_collection_cooldown() {
 	[ -z "$cutoff" ] || .venv/bin/python - "$cutoff" "$@" <<'PY'
 import json, sys, urllib.parse, urllib.request
@@ -92,14 +91,23 @@ PY
 write_lock() {
 	# The index URL can carry credentials, and argv is world-readable in /proc while the environment is not.
 	LOCK_INDEX="${index:-https://pypi.org/simple}" .venv/bin/python - "$1" "$2" "$3" "$cutoff" <<'PY'
-import json, os, re, sys, urllib.request
+import base64, json, os, re, sys, urllib.parse, urllib.request
 report, out, header, cutoff = sys.argv[1:5]
-index = os.environ["LOCK_INDEX"]
+index = urllib.parse.urlsplit(os.environ["LOCK_INDEX"])
+# urllib ignores the user:password of a URL, so they go as the Basic header pip would send, and no redirect carries it on.
+auth = None
+if index.username is not None:
+    login = "%s:%s" % (urllib.parse.unquote(index.username), urllib.parse.unquote(index.password or ""))
+    auth = "Basic " + base64.b64encode(login.encode()).decode()
+    index = index._replace(netloc=index.netloc.rpartition("@")[2])
+index = urllib.parse.urlunsplit(index)
 rows = []
 for item in json.load(open(report))["install"]:
     name = re.sub(r"[-_.]+", "-", item["metadata"]["name"]).lower()
     version = item["metadata"]["version"]
     request = urllib.request.Request("%s/%s/" % (index.rstrip("/"), name), headers={"Accept": "application/vnd.pypi.simple.v1+json"})
+    if auth:
+        request.add_unredirected_header("Authorization", auth)
     files = json.load(urllib.request.urlopen(request, timeout=60))["files"]
     hashes = sorted({f["hashes"]["sha256"] for f in files
                      if f["filename"].endswith(".whl") and f["filename"].split("-")[1] == version
@@ -134,7 +142,7 @@ step() {
 
 usage() {
 	cat <<'USAGE'
-Usage: init-ansible.sh [-f] [-d] [<project-path>]
+Usage: init-ansible.sh [-f] [-d | -o] [<project-path>]
 
 Creates .venv from a hash-locked requirements.txt, ansible.cfg, dev/prod
 inventories with separate vault keys, playbooks/, roles/, pinned and
@@ -154,7 +162,11 @@ project is not empty, so that needs -f.
                      is in both sets. First-run choice: -d on a project already
                      locked to another set is refused, delete requirements.in
                      and requirements.txt first
-  PYTHON_VERSION=X   pin the interpreter a new venv is built with (default:
+  -o                 offline: the same layout for a machine without network,
+                     run with the ansible-core and python3 installed there -
+                     no venv, lock, collections, audit or lint, and nothing
+                     is downloaded
+  PYTHON_VERSION=X  pin the interpreter a new venv is built with (default:
                      python3). An interpreter older than ansible-core
                      supports is refused rather than locked to an old core. An
                      existing .venv keeps the Python it was created with;
@@ -164,7 +176,7 @@ project is not empty, so that needs -f.
                      usually pulled within days; 0 turns that off, for a fix
                      that cannot wait
 
-Needs network access to PyPI and Ansible Galaxy.
+Needs network access to PyPI and Ansible Galaxy, except with -o.
 
 -f on a clone runs that clone's ansible.cfg, playbook and lint on this
 machine, so use it only on a repository you trust.
@@ -173,17 +185,19 @@ USAGE
 
 force=0
 devtools=0
+offline=0
 # getopts stops at the first non-option argument, so the path is set aside and parsing continues past it.
 args=()
 while [ $# -gt 0 ]; do
 	OPTIND=1
-	while getopts ':fdh' o; do
+	while getopts ':fdoh' o; do
 		case $o in
 		f) force=1 ;;
 		d)
 			devtools=1
 			PACKAGES=(ansible-dev-tools)
 			;;
+		o) offline=1 ;;
 		h)
 			usage
 			exit 0
@@ -207,6 +221,8 @@ set -- ${args[@]+"${args[@]}"}
 	usage >&2
 	exit 2
 }
+[ "$devtools" -eq 0 ] || [ "$offline" -eq 0 ] || die "-d picks the packages to install and -o installs none; use one or the other"
+[ "$offline" -eq 0 ] || STEPS=4
 case $COOLDOWN_DAYS in
 '' | *[!0-9]*) die "COOLDOWN_DAYS=$COOLDOWN_DAYS is not a whole number of days" ;;
 esac
@@ -214,6 +230,10 @@ command -v git >/dev/null 2>&1 || die "git not found; Git 2.28 or newer is requi
 
 project=${1:-.}
 [ ! -e "$project" ] || [ -d "$project" ] || die "$project is a file, not a directory"
+# The home directory holds ~/.ansible and often a personal .venv, and git init would make all of it one repository.
+if [ -d "$project" ] && [ "$(cd -P -- "$project" && pwd -P)" = "$(cd -P -- "$HOME" && pwd -P)" ]; then
+	die "$project is your home directory; scaffold into a directory of its own"
+fi
 # ls -A counts dotfiles, so a lone .DS_Store trips this on a directory that looks empty; name what was found.
 existing=$(ls -A "$project" 2>/dev/null || true)
 if [ -n "$existing" ] && [ "$force" -eq 0 ]; then
@@ -238,7 +258,7 @@ if [ "$devtools" -eq 1 ] && [ -f requirements.in ] && ! grep -qx ansible-dev-too
 	die "-d asks for ansible-dev-tools but requirements.in already locks $(head -1 requirements.in); delete requirements.in and requirements.txt to switch package set"
 fi
 # A lock from before navigator joined the default set would fail in verify; a dev-tools lock already carries it.
-if [ "$devtools" -eq 0 ] && [ -f requirements.in ] && ! grep -qxE 'ansible-navigator|ansible-dev-tools' requirements.in; then
+if [ "$devtools" -eq 0 ] && [ "$offline" -eq 0 ] && [ -f requirements.in ] && ! grep -qxE 'ansible-navigator|ansible-dev-tools' requirements.in; then
 	die "requirements.in was locked before ansible-navigator became standard; delete requirements.in and requirements.txt to relock with it"
 fi
 
@@ -272,108 +292,117 @@ for marker in roles/.gitkeep inventory/dev/host_vars/.gitkeep inventory/prod/hos
 	[ -e "$marker" ] || [ -L "$marker" ] || : >"$marker"
 done
 
-step virtualenv
-export PIP_DISABLE_PIP_VERSION_CHECK=1
-# The default 15s read timeout trips on slow or proxied links while fetching large wheels.
-export PIP_TIMEOUT=60
-# A venv is bound to the interpreter that built it, so PYTHON_VERSION cannot re-point an existing one.
-if [ -d .venv ]; then
-	have=$(.venv/bin/python -c 'import sys;print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null) ||
-		die ".venv exists but its python does not run; delete .venv and re-run to rebuild it"
-	# bin/python is a symlink and survives a move; the console scripts' absolute shebangs do not.
-	if ! .venv/bin/pip --version >/dev/null 2>&1; then
-		# sed on a missing pip must not let set -e kill the script before die speaks
-		shebang=$(sed -n '1s/^#!//p' .venv/bin/pip 2>/dev/null || true)
-		case $shebang in
-		"$root"/.venv/*) die ".venv has a pip that does not run; delete .venv and re-run to rebuild it" ;;
-		?*)
-			# A venv path with a space gets a /bin/sh trampoline, not a direct shebang.
-			origin=${shebang%/bin/*}
-			die ".venv was built at ${origin:-another path} and the project now lives at $root; a venv is not relocatable - delete .venv and re-run to rebuild it"
-			;;
-		*) die ".venv has no working pip; delete .venv and re-run to rebuild it" ;;
+if [ "$offline" -eq 1 ]; then
+	step "tools on PATH (offline)"
+	found=$(command -v ansible-playbook) || die "ansible-playbook not found; -o runs the ansible-core already installed here and downloads nothing"
+	printf 'using %s\n' "$found"
+	py="python${PYTHON_VERSION:-3}"
+	command -v "$py" >/dev/null 2>&1 || die "$py not found; install it or pick another with PYTHON_VERSION="
+else
+	step virtualenv
+	export PIP_DISABLE_PIP_VERSION_CHECK=1
+	# The default 15s read timeout trips on slow or proxied links while fetching large wheels.
+	export PIP_TIMEOUT=60
+	# A venv is bound to the interpreter that built it, so PYTHON_VERSION cannot re-point an existing one.
+	if [ -d .venv ]; then
+		have=$(.venv/bin/python -c 'import sys;print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null) ||
+			die ".venv exists but its python does not run; delete .venv and re-run to rebuild it"
+		# bin/python is a symlink and survives a move; the console scripts' absolute shebangs do not.
+		if ! .venv/bin/pip --version >/dev/null 2>&1; then
+			# sed on a missing pip must not let set -e kill the script before die speaks
+			shebang=$(sed -n '1s/^#!//p' .venv/bin/pip 2>/dev/null || true)
+			case $shebang in
+			"$root"/.venv/*) die ".venv has a pip that does not run; delete .venv and re-run to rebuild it" ;;
+			?*)
+				# A venv path with a space gets a /bin/sh trampoline, not a direct shebang.
+				origin=${shebang%/bin/*}
+				die ".venv was built at ${origin:-another path} and the project now lives at $root; a venv is not relocatable - delete .venv and re-run to rebuild it"
+				;;
+			*) die ".venv has no working pip; delete .venv and re-run to rebuild it" ;;
+			esac
+		fi
+		printf 'keep .venv (Python %s)\n' "$have"
+		case $PYTHON_VERSION in
+		'' | "$have" | "${have%.*}" | "${have%%.*}") ;;
+		*) die "PYTHON_VERSION=$PYTHON_VERSION but .venv already runs Python $have; a venv cannot be re-pointed, delete .venv to rebuild it" ;;
 		esac
-	fi
-	printf 'keep .venv (Python %s)\n' "$have"
-	case $PYTHON_VERSION in
-	'' | "$have" | "${have%.*}" | "${have%%.*}") ;;
-	*) die "PYTHON_VERSION=$PYTHON_VERSION but .venv already runs Python $have; a venv cannot be re-pointed, delete .venv to rebuild it" ;;
-	esac
-	py_probe .venv/bin/python >/dev/null ||
-		printf 'warning: .venv runs Python %s, which is older than ansible-core supports; delete .venv and requirements.txt to relock on a newer one\n' "$have" >&2
-else
-	interp="python${PYTHON_VERSION:-3}"
-	command -v "$interp" >/dev/null 2>&1 || die "$interp not found; install it or pick another with PYTHON_VERSION="
-	# Too old an interpreter still builds a venv, and the resolver then locks the last ansible-core that supported it.
-	pick=$(py_probe "$interp") ||
-		die "Python $pick is below the minimum ansible-core supports, so a lock made on it would pin an older core than the rest of the toolchain; pick $MIN_PYTHON or newer with PYTHON_VERSION="
-	"$interp" -m venv .venv
-fi
-# A venv from a Windows python has Scripts/, not bin/, and the CA probe below would blame the certificate store for it.
-[ -x .venv/bin/python ] || die ".venv has no bin/python, so it was not built by a POSIX python; on Windows run this from WSL"
-# A python without a CA bundle fails HTTPS minutes into the downloads; OpenSSL fills a hashed cert directory lazily, so the store count alone reads as empty on a capath-only system.
-.venv/bin/python -c 'import os,ssl,sys; p=ssl.get_default_verify_paths(); sys.exit(not (p.cafile or (p.capath and os.listdir(p.capath)) or ssl.create_default_context().cert_store_stats()["x509_ca"]))' ||
-	die "this python trusts no CA certificates, so HTTPS will fail; pick another with PYTHON_VERSION=, or set SSL_CERT_FILE to your CA bundle"
-pyver=$(.venv/bin/python -c 'import sys;print("%d.%d" % sys.version_info[:2])')
-lock_platform=$(.venv/bin/python -c 'import platform;print("%s-%s" % (platform.system().lower(), platform.machine().lower()))')
-# Anything uploaded inside the cooldown is invisible to both resolvers, so a release hijacked this week cannot end up in a lock.
-cutoff=
-if [ "$COOLDOWN_DAYS" -gt 0 ]; then
-	cutoff=$(.venv/bin/python -c 'import datetime,sys;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=int(sys.argv[1]))).replace(microsecond=0).isoformat().replace("+00:00","Z"))' "$COOLDOWN_DAYS")
-fi
-step "dependencies (the first run resolves and hash-locks every package)"
-# pip-audit is the engineer's audit tool and pip both resolves and installs the lock, so both are pinned in it.
-printf '%s\n' "${PACKAGES[@]}" pip-audit pip | put requirements.in
-if [ -e requirements.txt ] || [ -L requirements.txt ]; then
-	[ -f requirements.txt ] || die "requirements.txt exists but is not a regular file"
-	# A lock is specific to the Python that resolved it, since markers and available wheels differ.
-	locked=$(sed -En 's/.*with Python ([0-9.]+).*/\1/p' requirements.txt | head -1)
-	if [ -n "$locked" ] && [ "$locked" != "$pyver" ]; then
-		die "requirements.txt was locked with Python $locked but .venv runs Python $pyver; delete requirements.txt to relock it, or rebuild .venv on Python $locked"
-	fi
-	locked_platform=$(sed -E -n 's/.* on ([^ ]+) (from|with) .*/\1/p' requirements.txt | head -1)
-	if [ -n "$locked_platform" ] && [ "$locked_platform" != "$lock_platform" ]; then
-		die "requirements.txt was locked on $locked_platform but this machine is $lock_platform, and a wheel pinned for one is not always published for the other; delete requirements.txt and re-run to relock here"
-	fi
-	if grep -q 'autogenerated by pip-compile' requirements.txt; then
-		die "requirements.txt is a legacy pip-compile lock that may install source distributions; delete it and requirements.in to relock wheels-only under a cooldown"
+		py_probe .venv/bin/python >/dev/null ||
+			printf 'warning: .venv runs Python %s, which is older than ansible-core supports; delete .venv and requirements.txt to relock on a newer one\n' "$have" >&2
 	else
-		printf 'keep requirements.txt\n'
+		interp="python${PYTHON_VERSION:-3}"
+		command -v "$interp" >/dev/null 2>&1 || die "$interp not found; install it or pick another with PYTHON_VERSION="
+		# Too old an interpreter still builds a venv, and the resolver then locks the last ansible-core that supported it.
+		pick=$(py_probe "$interp") ||
+			die "Python $pick is below the minimum ansible-core supports, so a lock made on it would pin an older core than the rest of the toolchain; pick $MIN_PYTHON or newer with PYTHON_VERSION="
+		"$interp" -m venv .venv
 	fi
-else
-	# put kept an old requirements.in; relocking it would pin pip-tools into the project and leave pip unpinned.
-	if grep -qx pip-tools requirements.in; then
-		die "requirements.in still lists pip-tools from the previous lock tool; delete it too, so the relock takes the current package set"
+	# A venv from a Windows python has Scripts/, not bin/, and the CA probe below would blame the certificate store for it.
+	[ -x .venv/bin/python ] || die ".venv has no bin/python, so it was not built by a POSIX python; on Windows run this from WSL"
+	# A python without a CA bundle fails HTTPS minutes into the downloads; OpenSSL fills a hashed cert directory lazily, so the store count alone reads as empty on a capath-only system.
+	.venv/bin/python -c 'import os,ssl,sys; p=ssl.get_default_verify_paths(); sys.exit(not (p.cafile or (p.capath and os.listdir(p.capath)) or ssl.create_default_context().cert_store_stats()["x509_ca"]))' ||
+		die "this python trusts no CA certificates, so HTTPS will fail; pick another with PYTHON_VERSION=, or set SSL_CERT_FILE to your CA bundle"
+	pyver=$(.venv/bin/python -c 'import sys;print("%d.%d" % sys.version_info[:2])')
+	lock_platform=$(.venv/bin/python -c 'import platform;print("%s-%s" % (platform.system().lower(), platform.machine().lower()))')
+	# Anything uploaded inside the cooldown is invisible to both resolvers, so a release hijacked this week cannot end up in a lock.
+	cutoff=
+	if [ "$COOLDOWN_DAYS" -gt 0 ]; then
+		cutoff=$(.venv/bin/python -c 'import datetime,sys;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=int(sys.argv[1]))).replace(microsecond=0).isoformat().replace("+00:00","Z"))' "$COOLDOWN_DAYS")
 	fi
-	# --uploaded-prior-to arrived in pip 26.0 and the venv's bundled pip may be older, so the lock is taken by a hash-pinned pip that obeys the cooldown itself. Bump it with
-	#   python3 -c 'import json,datetime as dt,urllib.request; d=json.load(urllib.request.urlopen("https://pypi.org/pypi/pip/json")); cut=(dt.datetime.now(dt.timezone.utc)-dt.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"); ok={v:f for v,f in d["releases"].items() if f and v.replace(".","").isdigit() and max(x["upload_time_iso_8601"] for x in f)<cut}; v=max(ok,key=lambda v:tuple(map(int,v.split(".")))); print("pip=="+v, *sorted("    --hash=sha256:"+x["digests"]["sha256"] for x in ok[v] if x["packagetype"]=="bdist_wheel"), sep=" \\\n")'
-	.venv/bin/pip install -q --require-hashes --only-binary=:all: -r /dev/stdin <<'BOOT'
+	step "dependencies (the first run resolves and hash-locks every package)"
+	# pip-audit is the engineer's audit tool and pip both resolves and installs the lock, so both are pinned in it.
+	printf '%s\n' "${PACKAGES[@]}" pip-audit pip | put requirements.in
+	if [ -e requirements.txt ] || [ -L requirements.txt ]; then
+		[ -f requirements.txt ] || die "requirements.txt exists but is not a regular file"
+		# A lock is specific to the Python that resolved it, since markers and available wheels differ.
+		locked=$(sed -En 's/.*with Python ([0-9.]+).*/\1/p' requirements.txt | head -1)
+		if [ -n "$locked" ] && [ "$locked" != "$pyver" ]; then
+			die "requirements.txt was locked with Python $locked but .venv runs Python $pyver; delete requirements.txt to relock it, or rebuild .venv on Python $locked"
+		fi
+		locked_platform=$(sed -E -n 's/.* on ([^ ]+) (from|with) .*/\1/p' requirements.txt | head -1)
+		if [ -n "$locked_platform" ] && [ "$locked_platform" != "$lock_platform" ]; then
+			die "requirements.txt was locked on $locked_platform but this machine is $lock_platform, and a wheel pinned for one is not always published for the other; delete requirements.txt and re-run to relock here"
+		fi
+		if grep -q 'autogenerated by pip-compile' requirements.txt; then
+			die "requirements.txt is a legacy pip-compile lock that may install source distributions; delete it and requirements.in to relock wheels-only under a cooldown"
+		else
+			printf 'keep requirements.txt\n'
+		fi
+	else
+		# put kept an old requirements.in; relocking it would pin pip-tools into the project and leave pip unpinned.
+		if grep -qx pip-tools requirements.in; then
+			die "requirements.in still lists pip-tools from the previous lock tool; delete it too, so the relock takes the current package set"
+		fi
+		# --uploaded-prior-to arrived in pip 26.0 and the venv's bundled pip may be older, so the lock is taken by a hash-pinned pip that obeys the cooldown itself. Bump it with
+		#   python3 -c 'import json,datetime as dt,urllib.request; d=json.load(urllib.request.urlopen("https://pypi.org/pypi/pip/json")); cut=(dt.datetime.now(dt.timezone.utc)-dt.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"); ok={v:f for v,f in d["releases"].items() if f and v.replace(".","").isdigit() and max(x["upload_time_iso_8601"] for x in f)<cut}; v=max(ok,key=lambda v:tuple(map(int,v.split(".")))); print("pip=="+v, *sorted("    --hash=sha256:"+x["digests"]["sha256"] for x in ok[v] if x["packagetype"]=="bdist_wheel"), sep=" \\\n")'
+		.venv/bin/pip install -q --require-hashes --only-binary=:all: -r /dev/stdin <<'BOOT'
 pip==26.2.1 \
     --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e
 BOOT
-	# write_lock reads the index on its own, so it is handed pip's CA bundle and index; pip itself already knows both.
-	cert=${PIP_CERT:-$(pip_option cert || true)}
-	[ -z "$cert" ] || export SSL_CERT_FILE="${SSL_CERT_FILE:-$cert}"
-	index=${PIP_INDEX_URL:-$(pip_option index-url || true)}
-	if [ -n "$cutoff" ]; then
-		cooldown=(--uploaded-prior-to "$cutoff")
-		provenance="from packages uploaded before $cutoff"
-	else
-		cooldown=()
-		provenance="with no cooldown"
+		# write_lock reads the index on its own, so it is handed pip's CA bundle and index; pip itself already knows both.
+		cert=${PIP_CERT:-$(pip_option cert || true)}
+		[ -z "$cert" ] || export SSL_CERT_FILE="${SSL_CERT_FILE:-$cert}"
+		index=${PIP_INDEX_URL:-$(pip_option index-url || true)}
+		if [ -n "$cutoff" ]; then
+			cooldown=(--uploaded-prior-to "$cutoff")
+			provenance="from packages uploaded before $cutoff"
+		else
+			cooldown=()
+			provenance="with no cooldown"
+		fi
+		# Wheels only: an sdist runs its build backend during resolution and installation, before any hash exists to check it against.
+		# The header records the Python and the cutoff, which is what a re-run checks and a reader wants to know.
+		.venv/bin/pip install -q --dry-run --ignore-installed --only-binary=:all: ${cooldown[@]+"${cooldown[@]}"} \
+			--report .venv/lock-report.json -r requirements.in
+		write_lock .venv/lock-report.json requirements.txt "init-ansible.sh, locked with Python $pyver on $lock_platform $provenance"
+		rm .venv/lock-report.json
 	fi
-	# Wheels only: an sdist runs its build backend during resolution and installation, before any hash exists to check it against.
-	# The header records the Python and the cutoff, which is what a re-run checks and a reader wants to know.
-	.venv/bin/pip install -q --dry-run --ignore-installed --only-binary=:all: ${cooldown[@]+"${cooldown[@]}"} \
-		--report .venv/lock-report.json -r requirements.in
-	write_lock .venv/lock-report.json requirements.txt "init-ansible.sh, locked with Python $pyver on $lock_platform $provenance"
-	rm .venv/lock-report.json
+	.venv/bin/pip install --require-hashes --only-binary=:all: -r requirements.txt
+	# Audit before any installed project tool runs, from the pins as locked: without --disable-pip, pip-audit fetches an unpinned pip past the cooldown and runs it.
+	.venv/bin/pip-audit --strict --disable-pip --timeout 60 --progress-spinner off -r requirements.txt ||
+		die "pip-audit failed on requirements.txt - the lines above say why; for a vulnerability, delete requirements.txt and re-run to relock, with COOLDOWN_DAYS=0 if the fixed release is newer than the cooldown"
+	export PATH="$root/.venv/bin:$PATH"
+	py=.venv/bin/python
 fi
-.venv/bin/pip install --require-hashes --only-binary=:all: -r requirements.txt
-# Audit before any installed project tool is executed.
-.venv/bin/pip-audit --strict --no-deps --timeout 60 --progress-spinner off -r requirements.txt ||
-	die "pip-audit rejected requirements.txt; delete it and re-run to relock, with COOLDOWN_DAYS=0 if the fixed release is newer than the cooldown"
-export PATH="$root/.venv/bin:$PATH"
 export ANSIBLE_CONFIG="$root/ansible.cfg"
 
 # Keys live outside the repo, and only the dev key is made here: a prod key generated on a developer machine looks real yet encrypts what prod cannot read.
@@ -387,11 +416,11 @@ for id in dev prod; do
 	if [ -e "$key" ] || [ -L "$key" ]; then
 		[ -f "$key" ] || die "$key exists but is not a regular file"
 		# umask protects only keys made here; a hand-copied shared key arrives with whatever mode it had.
-		.venv/bin/python -c 'import os,sys; sys.exit((os.stat(sys.argv[1]).st_mode & 0o077) != 0)' "$key" ||
+		"$py" -c 'import os,sys; sys.exit((os.stat(sys.argv[1]).st_mode & 0o077) != 0)' "$key" ||
 			die "$key is readable by group or others; chmod 600 it - a vault key is a password"
 		printf 'keep %s\n' "$key"
 	elif [ "$id" = dev ]; then
-		(umask 077 && .venv/bin/python -c 'import secrets;print(secrets.token_urlsafe(32))' >"$key")
+		(umask 077 && "$py" -c 'import secrets;print(secrets.token_urlsafe(32))' >"$key")
 		printf 'generated %s - store it in the password manager; on a clone, replace it with the shared key\n' "$key"
 	else
 		printf 'missing %s - only whoever operates prod needs it; README under Vault says how it is made\n' "$key"
@@ -411,12 +440,20 @@ ansible-navigator:
     enable: false
 NAV
 
+if [ "$offline" -eq 1 ]; then
+	# Offline, collections are whatever the machine already has, and profile_tasks comes from ansible.posix, which ansible-core lacks.
+	collections_path='collections:~/.ansible/collections:/usr/share/ansible/collections'
+	callbacks='# Needs the ansible.posix collection: callbacks_enabled = ansible.posix.profile_tasks'
+else
+	collections_path=collections
+	callbacks='callbacks_enabled = ansible.posix.profile_tasks'
+fi
 put ansible.cfg <<CFG
 [defaults]
 # Dev by default; production runs must pass -i inventory/prod explicitly.
 inventory = inventory/dev
 roles_path = roles
-collections_path = collections
+collections_path = $collections_path
 interpreter_python = auto_silent
 host_key_checking = True
 forks = 20
@@ -424,7 +461,7 @@ forks = 20
 retry_files_enabled = False
 display_skipped_hosts = False
 callback_result_format = yaml
-callbacks_enabled = ansible.posix.profile_tasks
+$callbacks
 vault_identity_list = dev@~/.ansible/vault/$name-dev, prod@~/.ansible/vault/$name-prod
 
 [privilege_escalation]
@@ -482,7 +519,7 @@ vault_check_new=0
 [ -e bin/vault-check.sh ] || [ -L bin/vault-check.sh ] || vault_check_new=1
 put bin/vault-check.sh <<'SH'
 #!/usr/bin/env bash
-# Fails if any vault file in the tree is plaintext, so it can never be committed that way.
+# Fails if any vault file on disk or in the index is plaintext, so it can never be committed that way.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 command -v git >/dev/null 2>&1 || {
@@ -496,8 +533,13 @@ while IFS= read -r -d '' f; do
 		scan_complete=1
 		continue
 	fi
-	if ! head -c 14 "$f" | grep -q '^\$ANSIBLE_VAULT'; then
+	if [ -e "$f" ] && ! head -c 14 "$f" | grep -q '^\$ANSIBLE_VAULT'; then
 		printf 'unencrypted vault file: %s\n' "$f" >&2
+		status=1
+	fi
+	# A commit takes the staged copy, which stays plaintext when a file was added before it was encrypted.
+	if git cat-file -e ":$f" 2>/dev/null && [ "$(git cat-file blob ":$f" | head -c 14)" != '$ANSIBLE_VAULT' ]; then
+		printf 'unencrypted vault file staged: %s\n' "$f" >&2
 		status=1
 	fi
 done < <({ git ls-files -co --exclude-standard -z -- '*vault*.yml' '*vault*.yaml' '*vault*.json' && printf '\0'; })
@@ -540,8 +582,10 @@ put .gitattributes <<'ATTR'
 * text=auto eol=lf
 ATTR
 
-# redhat.ansible expands ${workspaceFolder} only in interpreterPath; executable paths stay relative to the workspace root.
-put .vscode/settings.json <<'JSON'
+# Offline there is no venv to point at, so the extensions keep finding the tools on PATH.
+if [ "$offline" -eq 0 ]; then
+	# redhat.ansible expands ${workspaceFolder} only in interpreterPath; executable paths stay relative to the workspace root.
+	put .vscode/settings.json <<'JSON'
 {
   "ansible.python.interpreterPath": "${workspaceFolder}/.venv/bin/python",
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
@@ -549,6 +593,7 @@ put .vscode/settings.json <<'JSON'
   "ansible.ansible.path": ".venv/bin/ansible"
 }
 JSON
+fi
 
 put .vscode/extensions.json <<'JSON'
 {
@@ -556,7 +601,28 @@ put .vscode/extensions.json <<'JSON'
 }
 JSON
 
-put README.md <<MD
+{
+	if [ "$offline" -eq 1 ]; then
+		cat <<MD
+# $name
+
+\`\`\`bash
+ansible-playbook playbooks/site.yml                      # dev (default inventory)
+ansible-playbook -i inventory/prod playbooks/site.yml    # prod, always explicit
+\`\`\`
+
+SSH is key-only; get keys onto new hosts first.
+
+## Tools
+
+Built offline: ansible-core and Python are whatever this machine has installed,
+and nothing is locked or downloaded. Collections are read from \`collections/\`,
+\`~/.ansible/collections\` and \`/usr/share/ansible/collections\`; one carried
+over as a tarball installs with
+\`ansible-galaxy collection install <file>.tar.gz -p collections\`.
+MD
+	else
+		cat <<MD
 # $name
 
 \`\`\`bash
@@ -588,6 +654,9 @@ To upgrade the Python packages, delete \`requirements.txt\` and re-run the
 scaffold with \`-f\`; it takes only releases older than \`COOLDOWN_DAYS\` (default
 7, \`0\` turns that off). To upgrade a collection, pin its \`version:\` in
 \`collections/requirements.yml\`, delete \`collections/lock.sha256\` and re-run.
+MD
+	fi
+	cat <<MD
 
 ## Vault
 
@@ -607,53 +676,55 @@ next to \`vars.yml\` and are referenced from there (\`db_password: "{{ vault_db_
 tasks that handle them get \`no_log: true\`. \`bin/vault-check.sh\` fails on any
 plaintext \`*vault*.yml\`, \`.yaml\` or \`.json\` file - run it before committing.
 MD
+} | put README.md
 
-step collections
-if [ -e collections/requirements.yml ] || [ -L collections/requirements.yml ]; then
-	[ -f collections/requirements.yml ] || die "collections/requirements.yml exists but is not a regular file"
-	printf 'keep collections/requirements.yml\n'
-	ansible-galaxy collection install -r collections/requirements.yml -p collections
-else
-	# Galaxy has no cooldown of its own, so each requested collection is pinned to its newest release from before the cutoff; dependencies are locked as installed.
-	pins=()
-	for c in "${COLLECTIONS[@]}"; do
-		v=$(galaxy_version "$c") || die "could not pick a release of $c from galaxy.ansible.com, so the cooldown cannot be applied"
-		pins+=("  - name: $c" "    version: \"$v\"")
-		printf 'pinned %s %s%s\n' "$c" "$v" "${cutoff:+ (newest release before $cutoff)}"
-	done
-	{
-		echo "---"
-		echo "collections:"
-		printf '%s\n' "${pins[@]}"
-	} >collections/requirements.yml
-	ansible-galaxy collection install -r collections/requirements.yml -p collections
-	# Galaxy picks the dependencies itself, so every installed version is held to the same cutoff before it is locked.
-	cooldown_rc=0
-	check_collection_cooldown collections/ansible_collections/*/*/MANIFEST.json || cooldown_rc=$?
-	case $cooldown_rc in
-	0) ;;
-	2)
-		rm -f collections/requirements.yml
-		die "a collection Galaxy installed as a dependency is newer than the cooldown; the pins were discarded but collections/ansible_collections still holds that install - remove it, then re-run once the release has aged, write your own pins into collections/requirements.yml, or use COOLDOWN_DAYS=0 for a release that cannot wait"
-		;;
-	*) die "the installed collections could not be held to the cooldown - the line above says why; the pins in collections/requirements.yml are kept, so re-run once Galaxy answers again" ;;
-	esac
-	# Re-pin to everything galaxy installed, dependencies included, so the file is a complete lockfile.
-	{
-		echo "---"
-		echo "collections:"
-		.venv/bin/python -c 'import json,sys; [print("%(namespace)s.%(name)s %(version)s" % json.load(open(f))["collection_info"]) for f in sorted(sys.argv[1:])]' collections/ansible_collections/*/*/MANIFEST.json |
-			while read -r c v; do printf '  - name: %s\n    version: "%s"\n' "$c" "$v"; done
-	} >collections/requirements.yml
-fi
-# Galaxy is trusted once: the installed manifests are hashed into a lock that every later install of the same versions has to match.
-manifests=$(.venv/bin/python -c 'import hashlib,sys; [print(hashlib.sha256(open(f,"rb").read()).hexdigest(), f) for f in sorted(sys.argv[1:])]' collections/ansible_collections/*/*/MANIFEST.json)
-if [ -e collections/lock.sha256 ] || [ -L collections/lock.sha256 ]; then
-	[ -f collections/lock.sha256 ] || die "collections/lock.sha256 exists but is not a regular file"
-	[ "$manifests" = "$(cat collections/lock.sha256)" ] || die "installed collections do not match collections/lock.sha256; if you added or upgraded a collection on purpose, pin its version in collections/requirements.yml and delete the lock, otherwise Galaxy served something else for the same versions"
-	printf 'keep collections/lock.sha256\n'
-else
-	printf '%s\n' "$manifests" >collections/lock.sha256
+if [ "$offline" -eq 0 ]; then
+	step collections
+	if [ -e collections/requirements.yml ] || [ -L collections/requirements.yml ]; then
+		[ -f collections/requirements.yml ] || die "collections/requirements.yml exists but is not a regular file"
+		printf 'keep collections/requirements.yml\n'
+		ansible-galaxy collection install -r collections/requirements.yml -p collections
+	else
+		# Galaxy has no cooldown of its own, so each requested collection is pinned to its newest release from before the cutoff; dependencies are locked as installed.
+		# A kept requirements.yml is installed unchecked, so the pins wait in .venv until the whole installed set has passed the cooldown.
+		pins=()
+		for c in "${COLLECTIONS[@]}"; do
+			v=$(galaxy_version "$c") || die "could not pick a release of $c from galaxy.ansible.com, so the cooldown cannot be applied"
+			pins+=("  - name: $c" "    version: \"$v\"")
+			printf 'pinned %s %s%s\n' "$c" "$v" "${cutoff:+ (newest release before $cutoff)}"
+		done
+		{
+			echo "---"
+			echo "collections:"
+			printf '%s\n' "${pins[@]}"
+		} >.venv/collection-pins.yml
+		ansible-galaxy collection install -r .venv/collection-pins.yml -p collections
+		# Galaxy picks the dependencies itself, so every installed version is held to the same cutoff before it is locked.
+		cooldown_rc=0
+		check_collection_cooldown collections/ansible_collections/*/*/MANIFEST.json || cooldown_rc=$?
+		case $cooldown_rc in
+		0) ;;
+		2) die "a collection Galaxy installed as a dependency is newer than the cooldown, so nothing was pinned; collections/ansible_collections still holds that install - remove it, then re-run once the release has aged, write your own pins into collections/requirements.yml, or use COOLDOWN_DAYS=0 for a release that cannot wait" ;;
+		*) die "the installed collections could not be held to the cooldown - the line above says why; nothing was pinned, so re-run once Galaxy answers again" ;;
+		esac
+		# Re-pin to everything galaxy installed, dependencies included, so the file is a complete lockfile.
+		{
+			echo "---"
+			echo "collections:"
+			.venv/bin/python -c 'import json,sys; [print("%(namespace)s.%(name)s %(version)s" % json.load(open(f))["collection_info"]) for f in sorted(sys.argv[1:])]' collections/ansible_collections/*/*/MANIFEST.json |
+				while read -r c v; do printf '  - name: %s\n    version: "%s"\n' "$c" "$v"; done
+		} >collections/requirements.yml
+		rm .venv/collection-pins.yml
+	fi
+	# Galaxy is trusted once: the installed manifests are hashed into a lock that every later install of the same versions has to match.
+	manifests=$(.venv/bin/python -c 'import hashlib,sys; [print(hashlib.sha256(open(f,"rb").read()).hexdigest(), f) for f in sorted(sys.argv[1:])]' collections/ansible_collections/*/*/MANIFEST.json)
+	if [ -e collections/lock.sha256 ] || [ -L collections/lock.sha256 ]; then
+		[ -f collections/lock.sha256 ] || die "collections/lock.sha256 exists but is not a regular file"
+		[ "$manifests" = "$(cat collections/lock.sha256)" ] || die "installed collections do not match collections/lock.sha256; if you added or upgraded a collection on purpose, pin its version in collections/requirements.yml and delete the lock, otherwise Galaxy served something else for the same versions"
+		printf 'keep collections/lock.sha256\n'
+	else
+		printf '%s\n' "$manifests" >collections/lock.sha256
+	fi
 fi
 
 if [ ! -d .git ]; then
@@ -662,18 +733,20 @@ fi
 
 step verify
 ansible --version | sed -n 1p
-ansible-lint --version | sed -n 1p
-ansible-navigator --version | sed -n 1p
-ansible-galaxy collection list -p collections 2>/dev/null | sed -n '/^ansible\./p;/^community\./p'
-# Imported plugins leave __pycache__ in the collection tree, which verify reports as modified content.
-find collections -name __pycache__ -type d -prune -exec rm -rf {} +
-ansible-galaxy collection verify --offline -r collections/requirements.yml -p collections
+if [ "$offline" -eq 0 ]; then
+	ansible-lint --version | sed -n 1p
+	ansible-navigator --version | sed -n 1p
+	ansible-galaxy collection list -p collections 2>/dev/null | sed -n '/^ansible\./p;/^community\./p'
+	# Imported plugins leave __pycache__ in the collection tree, which verify reports as modified content.
+	find collections -name __pycache__ -type d -prune -exec rm -rf {} +
+	ansible-galaxy collection verify --offline -r collections/requirements.yml -p collections
+fi
 bin/vault-check.sh
 ansible-inventory -i inventory/dev --graph
-ansible-lint
+[ "$offline" -eq 1 ] || ansible-lint
 ansible-playbook playbooks/site.yml --check
 printf '    done in %ds\n\nOK: %s\n' "$(($(date +%s) - step_start))" "$root"
-# The venv PATH belonged to this script, so the calling shell is not in the venv.
+[ "$offline" -eq 0 ] || exit 0
 cat <<MSG
 
 Your shell is not in the venv - this run's PATH went with the script. Enter it

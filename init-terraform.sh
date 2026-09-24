@@ -33,7 +33,7 @@ step() {
 
 usage() {
 	cat <<'USAGE'
-Usage: init-terraform.sh [-f] [<project-path>]
+Usage: init-terraform.sh [-f] [-o] [<project-path>]
 
 Creates versions.tf, backend.tf, main.tf, variables.tf, outputs.tf,
 modules/, per-environment tfvars, .gitignore and an empty git repo (you make
@@ -50,9 +50,12 @@ project is not empty, so that needs -f.
               so a project that keeps them under other file names does
               not end up declaring either of them twice; two copies
               already on disk are named and the run stops
+  -o          offline: no provider, so nothing is downloaded - the
+              placeholder is the built-in terraform_data and versions.tf
+              pins only the core version
   TF_BIN=x    binary to run (default: terraform)
 
-Needs network access for the provider download.
+Needs network access for the provider download, except with -o.
 
 -f runs init, validate and plan against the existing Terraform configuration,
 which may download and execute provider code. Use it only on repositories you
@@ -61,13 +64,15 @@ USAGE
 }
 
 force=0
+offline=0
 # getopts stops at the first non-option argument, so the path is set aside and parsing continues past it.
 args=()
 while [ $# -gt 0 ]; do
 	OPTIND=1
-	while getopts ':fh' o; do
+	while getopts ':foh' o; do
 		case $o in
 		f) force=1 ;;
+		o) offline=1 ;;
 		h)
 			usage
 			exit 0
@@ -96,6 +101,10 @@ command -v git >/dev/null 2>&1 || die "git not found; Git 2.28 or newer is requi
 
 project=${1:-.}
 [ ! -e "$project" ] || [ -d "$project" ] || die "$project is a file, not a directory"
+# git init in the home directory would make everything below it one repository.
+if [ -d "$project" ] && [ "$(cd -P -- "$project" && pwd -P)" = "$(cd -P -- "$HOME" && pwd -P)" ]; then
+	die "$project is your home directory; scaffold into a directory of its own"
+fi
 # ls -A counts dotfiles, so a lone .DS_Store trips this on a directory that looks empty; name what was found.
 existing=$(ls -A "$project" 2>/dev/null || true)
 if [ -n "$existing" ] && [ "$force" -eq 0 ]; then
@@ -161,7 +170,7 @@ else
 	fi
 	if owner=$(declares "$providers_hcl" "$providers_json"); then
 		printf 'keep required_providers in %s\n' "${owner%%$'\n'*}"
-	else
+	elif [ "$offline" -eq 0 ]; then
 		settings+=('  required_providers {
     random = {
       source  = "hashicorp/random"
@@ -214,22 +223,27 @@ variable "tags" {
 }
 TF
 
-put main.tf <<'TF'
+# Offline there is no registry to fetch a provider from, so the placeholder is Terraform's built-in terraform_data.
+if [ "$offline" -eq 1 ]; then
+	placeholder=$'resource "terraform_data" "placeholder" {\n  input = var.environment\n}'
+	placeholder_value=terraform_data.placeholder.output
+else
+	placeholder=$'resource "random_pet" "placeholder" {\n  length = 2\n  prefix = var.environment\n}'
+	placeholder_value=random_pet.placeholder.id
+fi
+put main.tf <<TF
 locals {
   tags = merge(var.tags, { environment = var.environment })
 }
 
 # Placeholder so init/validate/plan prove the chain; delete once real resources exist.
-resource "random_pet" "placeholder" {
-  length = 2
-  prefix = var.environment
-}
+$placeholder
 TF
 
-put outputs.tf <<'TF'
+put outputs.tf <<TF
 output "placeholder_name" {
   description = "Proof the root module plans and applies."
-  value       = random_pet.placeholder.id
+  value       = $placeholder_value
 }
 TF
 
@@ -276,7 +290,8 @@ put .vscode/extensions.json <<'JSON'
 }
 JSON
 
-put README.md <<MD
+{
+	cat <<MD
 # $(basename "$root")
 
 \`\`\`bash
@@ -298,6 +313,14 @@ root or an independently locked remote backend and state key.
 Commit \`.terraform.lock.hcl\`. For mixed platforms, record each one once:
 \`terraform providers lock -platform=linux_amd64 -platform=darwin_arm64\`.
 MD
+	[ "$offline" -eq 0 ] || cat <<'MD'
+
+Built offline, so no provider is required yet. One needs the registry or a
+local copy of it: `terraform providers mirror <dir>` on a machine with network,
+then a `filesystem_mirror` for `<dir>` under `provider_installation` in the
+CLI configuration here.
+MD
+} | put README.md
 
 # init asks checkpoint.hashicorp.com whether a newer release exists; the scaffold has no use for the answer.
 export CHECKPOINT_DISABLE=1

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Self-check: both scaffolds build and verify, refuse non-empty dirs, keep files under -f, vault round-trips.
+# Self-check: both scaffolds build and verify online and offline, refuse non-empty dirs, keep files under -f, vault round-trips.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 repo=$PWD
@@ -12,6 +12,8 @@ mkdir -p "$home"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$HOME/.cache/pip}"
 # Fixtures that stand in for the scaffold's venv must use the interpreter it would.
 py="python${PYTHON_VERSION:-3}"
+# Every proxy points at a closed port, so anything that reaches for the network fails.
+no_net=(env https_proxy=http://127.0.0.1:1 HTTPS_PROXY=http://127.0.0.1:1 http_proxy=http://127.0.0.1:1 HTTP_PROXY=http://127.0.0.1:1 no_proxy= NO_PROXY=)
 
 fail() {
 	printf 'fail: %s\n' "$*" >&2
@@ -51,6 +53,9 @@ for s in init-ansible.sh init-terraform.sh; do
 	# ~/home/you/x is a typo for ~/x; mkdir -p would build the whole path silently.
 	expect "$("$repo/$s" "$tmp/nosuch/deep" 2>&1 || true)" '*does not exist*' "$s: a path whose parent is missing was not refused"
 	[ ! -e "$tmp/nosuch" ] || fail "$s: a path whose parent is missing was created anyway"
+	athome=$(cd "$home" && { HOME=$home "$repo/$s" -f 2>&1 || true; })
+	expect "$athome" '*home directory*' "$s: the home directory was accepted as a project"
+	[ ! -e "$home/.git" ] || fail "$s: git init ran in the home directory"
 done
 # A bogus interpreter stops the run at step 1 without network; the layout next to the caller proves -f scaffolded in place.
 inplace=$(cd "$tmp/here" && { HOME=$home PYTHON_VERSION=-missing "$repo/init-ansible.sh" -f 2>&1 || true; })
@@ -186,6 +191,12 @@ cp "$tmp/tfhalf/terraform.tf" "$tmp/tfover/random_override.tf"
 ./init-terraform.sh -f "$tmp/tfover" >/dev/null || fail "terraform: an override file was mistaken for a duplicate"
 echo "ok: terraform names an existing duplicate and ignores override files"
 
+"${no_net[@]}" ./init-terraform.sh -o "$tmp/tfoff" >/dev/null || fail "terraform: -o needed the network"
+[ ! -e "$tmp/tfoff/.terraform.lock.hcl" ] || fail "terraform: -o required a provider"
+grep -q terraform_data "$tmp/tfoff/main.tf" || fail "terraform: -o placeholder is not the built-in terraform_data"
+"${TF_BIN:-terraform}" fmt -check -recursive "$tmp/tfoff" >/dev/null || fail "terraform: -o files are not canonically formatted"
+echo "ok: terraform -o scaffolds without network"
+
 # A directory holding only a dotfile looks empty, so the guard has to name what it found.
 mkdir -p "$tmp/hidden"
 : >"$tmp/hidden/.DS_Store"
@@ -238,6 +249,29 @@ rc=0
 rc=0
 https_proxy=http://127.0.0.1:1 "$py" "$tmp/checker.py" 2000-01-01T00:00:00Z "${installed[0]}" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 1 ] || fail "ansible: an unreachable Galaxy must exit 1, got $rc - anything else reads as a cooldown violation"
+# urllib ignores the user:password of a URL, so write_lock has to send a credentialed index's login itself.
+"$py" - "$repo/init-ansible.sh" "$tmp" <<'LOCK' || fail "ansible: write_lock did not log in to a credentialed index"
+import base64, http.server, json, os, re, subprocess, sys, threading
+code = re.search(r"write_lock\(\) \{.*?<<'PY'\n(.*?)\nPY\n", open(sys.argv[1]).read(), re.S).group(1)
+tmp, digest = sys.argv[2], "ab" * 32
+class Index(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        ok = self.headers.get("Authorization") == "Basic " + base64.b64encode(b"u:p w").decode()
+        self.send_response(200 if ok else 401)
+        self.end_headers()
+        if ok:
+            self.wfile.write(json.dumps({"files": [{"filename": "demo-1.0-py3-none-any.whl", "hashes": {"sha256": digest}}]}).encode())
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(("127.0.0.1", 0), Index)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+report, lock = os.path.join(tmp, "report.json"), os.path.join(tmp, "lock.txt")
+with open(report, "w") as fh:
+    json.dump({"install": [{"metadata": {"name": "demo", "version": "1.0"}, "download_info": {"archive_info": {"hashes": {"sha256": digest}}}}]}, fh)
+env = dict(os.environ, LOCK_INDEX="http://u:p%%20w@127.0.0.1:%d/simple" % server.server_port, no_proxy="127.0.0.1")
+locked = subprocess.run([sys.executable, "-c", code, report, lock, "header", ""], env=env, stderr=subprocess.DEVNULL).returncode == 0
+sys.exit(not (locked and digest in open(lock).read()))
+LOCK
 echo "ok: ansible scaffold"
 
 # Finder writes .DS_Store into any directory it opens, so an unignored one lands in the first commit.
@@ -262,7 +296,34 @@ rm "$tmp/ans/inventory/prod/group_vars/all/vault.yml"
 printf '{"plain": "oops"}\n' >"$tmp/ans/inventory/prod/group_vars/all/vault.json"
 ! "$tmp/ans/bin/vault-check.sh" 2>/dev/null || fail "ansible: vault-check accepted a non-YAML plaintext vault file"
 rm "$tmp/ans/inventory/prod/group_vars/all/vault.json"
+# A commit takes the staged copy, so a vault file staged in plaintext and encrypted only afterwards has to fail too.
+staged=inventory/prod/group_vars/all/vault.yml
+printf 'plain: staged\n' >"$tmp/ans/$staged"
+git -C "$tmp/ans" add -- "$staged"
+HOME=$home ANSIBLE_CONFIG="$tmp/ans/ansible.cfg" "$tmp/ans/.venv/bin/ansible-vault" encrypt --encrypt-vault-id dev "$tmp/ans/$staged" >/dev/null 2>&1
+staged_msg=$("$tmp/ans/bin/vault-check.sh" 2>&1) && fail "ansible: vault-check accepted a vault file that is still staged in plaintext"
+[ "$staged_msg" = "unencrypted vault file staged: $staged" ] || fail "ansible: vault-check did not name just the plaintext left in the index; got: $staged_msg"
+git -C "$tmp/ans" rm -q -f -- "$staged"
 echo "ok: vault round-trip and plaintext guard"
+
+# -o runs on an ansible-core that is already installed; the scaffold's venv stands in for one, reached only through PATH.
+mkdir -p "$tmp/core"
+for t in ansible ansible-config ansible-galaxy ansible-inventory ansible-playbook ansible-vault; do
+	ln -s "$tmp/ans/.venv/bin/$t" "$tmp/core/$t"
+done
+off=$(PATH="$tmp/core:$PATH" HOME=$home "${no_net[@]}" ./init-ansible.sh -o "$tmp/ansoff" 2>&1) || fail "ansible: -o failed without network: $off"
+expect "$off" '*1/4] tools on PATH*' "ansible: -o did not run on the tools on PATH"
+for f in .venv requirements.txt collections/requirements.yml .vscode/settings.json; do
+	[ ! -e "$tmp/ansoff/$f" ] || fail "ansible: -o wrote $f, which only an online run has a use for"
+done
+! grep -q '^callbacks_enabled' "$tmp/ansoff/ansible.cfg" || fail "ansible: -o enabled a callback that ansible-core does not ship"
+mode600 "$home/.ansible/vault/ansoff-dev" || fail "ansible: -o did not make the dev key"
+# Without a requirements.yml nothing can reinstall a collection, so one carried in by hand is not clean.sh's to remove.
+mkdir -p "$tmp/ansoff/collections/ansible_collections/carried"
+./clean.sh "$tmp/ansoff" >/dev/null
+[ -d "$tmp/ansoff/collections/ansible_collections/carried" ] || fail "clean: removed collections an offline project cannot reinstall"
+expect "$(./init-ansible.sh -o -d "$tmp/ansoff" 2>&1 || true)" '*use one or the other*' "ansible: -o together with -d was not refused"
+echo "ok: ansible -o scaffolds from the installed ansible-core without network"
 
 # A shared key copied into place can arrive group-readable, and a re-run has to refuse it.
 chmod 644 "$home/.ansible/vault/ans-dev"
@@ -305,7 +366,7 @@ printf '%s\n' '[defaults]' 'vault_identity_list = dev@~/.ansible/vault/a-dev, pr
 twice=$(HOME=$home ./init-ansible.sh -f "$tmp/foreign" 2>&1 || true)
 expect "$twice" '*more than once*' "ansible: a duplicated vault_identity_list was not refused"
 [ ! -e "$tmp/foreign/.venv" ] || fail "ansible: a foreign ansible.cfg was refused only after the venv was built"
-bad_cooldown=$(COOLDOWN_DAYS=week ./init-ansible.sh "$tmp/cool" 2>&1 || true)
+bad_cooldown=$(HOME=$home COOLDOWN_DAYS=week ./init-ansible.sh "$tmp/cool" 2>&1 || true)
 expect "$bad_cooldown" '*not a whole number of days*' "ansible: a non-numeric COOLDOWN_DAYS was not refused"
 echo "ok: traversing key name and bad cooldown refused"
 
@@ -380,7 +441,8 @@ echo "ok: PYTHON_VERSION refused against an existing .venv"
 cp "$tmp/ans/requirements.txt" "$tmp/req.before"
 printf 'mine\n' >"$tmp/ans/README.md"
 # The version it already runs must be accepted, and the run has to close by saying how to enter the venv.
-rerun=$(HOME=$home PYTHON_VERSION=$have ./init-ansible.sh -f "$tmp/ans")
+# Everything is installed, so no package index is needed; a pip-audit that reached for one would be running an unpinned pip.
+rerun=$(HOME=$home PYTHON_VERSION=$have PIP_NO_INDEX=1 ./init-ansible.sh -f "$tmp/ans")
 expect "$rerun" '*source .venv/bin/activate*' "ansible: final output does not say how to enter the venv"
 [ "$(cat "$tmp/ans/README.md")" = mine ] || fail "ansible: -f overwrote README.md"
 cmp -s "$tmp/req.before" "$tmp/ans/requirements.txt" || fail "ansible: -f changed requirements.txt"
@@ -414,6 +476,10 @@ HOME=$home PIP_CACHE_DIR="$home/.cache/pip-custom" ./clean.sh -c "$tmp/ans" >/de
 env -u PIP_CACHE_DIR HOME="$home" ./clean.sh -c "$tmp/ans" >/dev/null
 [ ! -e "$home/.cache/pip" ] || fail "clean: -c kept the pip cache"
 mode600 "$home/.ansible/vault/ans-dev" || fail "clean: the dev key is gone"
+# In the home directory .ansible is the vault key store, not lint's cache, so clean.sh must refuse to run there.
+athome=$(cd "$home" && { HOME=$home "$repo/clean.sh" 2>&1 || true; })
+expect "$athome" '*home directory*' "clean: the home directory was cleaned as a project"
+mode600 "$home/.ansible/vault/ans-dev" || fail "clean: removed the vault keys from the home directory"
 echo "ok: clean leaves vault keys alone and confines -c to the cache roots"
 
 echo "all ok"

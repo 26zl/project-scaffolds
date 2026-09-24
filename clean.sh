@@ -67,6 +67,8 @@ project=${1:-.}
 [ -d "$project" ] || die "$project is not a directory"
 cd "$project"
 root=$PWD
+# ~/.ansible holds the vault keys, and in a project .ansible is only lint's cache, so the home directory is never cleaned.
+[ "$(pwd -P)" != "$(cd -P -- "$HOME" && pwd -P)" ] || die "$root is your home directory, not a project; name the project to clean"
 
 # Everything is collected first and removed last, so a refusal below leaves the project untouched.
 targets=()
@@ -95,7 +97,8 @@ add_cache() {
 # What a scaffold run or the tools it installs write next to the project files; each is rebuilt or regenerated.
 # Logs are named one by one: a *.log glob would also take a log the project keeps by hand, which nothing rebuilds.
 add .venv
-add collections/ansible_collections
+# Installed collections are rebuilt from requirements.yml; an offline project has none, so its collections were carried in by hand.
+[ ! -f collections/requirements.yml ] || add collections/ansible_collections
 add .ansible
 add .ansible_cache
 add .terraform
