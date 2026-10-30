@@ -1,0 +1,18 @@
+# What a scaffold run or a test leaves behind if a project is generated inside this clone
+.venv/
+__pycache__/
+*.retry
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+*.log
+
+# macOS and editors
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
